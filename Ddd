@@ -1,0 +1,194 @@
+local P, RS, UIS = game:GetService("Players"), game:GetService("RunService"), game:GetService("UserInputService")
+local me, cam = P.LocalPlayer, workspace.CurrentCamera
+local on, rand, smooth, target = false, false, 0.5, nil
+
+local function new(c, props, parent)
+	local i = Instance.new(c)
+	for k, v in props do i[k] = v end
+	i.Parent = parent
+	return i
+end
+
+local function outline(i, r, t)
+	new("UICorner", {CornerRadius = UDim.new(0, r)}, i)
+	new("UIStroke", {Thickness = t, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, i)
+end
+
+local function isPress(i)
+	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMove(i)
+	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local YELLOW = Color3.fromRGB(255, 214, 64)
+
+-- ===== UI =====
+local gui = new("ScreenGui", {Name = "AimLock", ResetOnSpawn = false, IgnoreGuiInset = true}, script.Parent)
+
+local NORMAL_SIZE = UDim2.new(0, 320, 0, 330)
+local win = new("Frame", {Size = NORMAL_SIZE, Position = UDim2.new(0, 90, 0.5, -165), BackgroundColor3 = YELLOW}, gui)
+outline(win, 20, 4)
+
+local bar = new("Frame", {Size = UDim2.new(1, -12, 0, 44), Position = UDim2.new(0, 6, 0, 6),
+	BackgroundColor3 = Color3.fromRGB(255, 120, 60)}, win)
+outline(bar, 14, 3)
+
+local function textProps(size, text)
+	return {Text = text, Font = Enum.Font.FredokaOne, TextSize = size, TextColor3 = Color3.new(1, 1, 1),
+		TextStrokeTransparency = 0}
+end
+
+local titleProps = textProps(24, "🎯 AIM LOCK")
+titleProps.Size, titleProps.Position, titleProps.BackgroundTransparency = UDim2.new(1, -110, 1, 0), UDim2.new(0, 10, 0, 0), 1
+titleProps.TextXAlignment = Enum.TextXAlignment.Left
+local title = new("TextLabel", titleProps, bar)
+
+local function barButton(text, w, x, color)
+	local p = textProps(18, text)
+	p.Size, p.Position, p.AnchorPoint, p.BackgroundColor3 = UDim2.new(0, w, 0, 32), UDim2.new(1, x, 0.5, 0), Vector2.new(1, 0.5), color
+	local b = new("TextButton", p, bar)
+	outline(b, 10, 3)
+	return b
+end
+
+local closeBtn = barButton("X", 32, -6, Color3.fromRGB(235, 70, 70))
+local fullBtn = barButton("FULL", 64, -44, Color3.fromRGB(80, 140, 255))
+
+local content = new("Frame", {Size = UDim2.new(1, -24, 1, -62), Position = UDim2.new(0.5, 0, 0, 56),
+	AnchorPoint = Vector2.new(0.5, 0), BackgroundTransparency = 1}, win)
+new("UIListLayout", {Padding = UDim.new(0, 10), HorizontalAlignment = Enum.HorizontalAlignment.Center}, content)
+new("UISizeConstraint", {MaxSize = Vector2.new(420, 4000)}, content)
+
+local function make(class, h, text, color)
+	local p = textProps(22, text)
+	p.Size, p.BackgroundColor3 = UDim2.new(1, 0, 0, h), color
+	local i = new(class, p, content)
+	outline(i, 16, 3)
+	return i
+end
+
+local toggle = make("TextButton", 50, "OFF [Q]", Color3.fromRGB(235, 70, 70))
+local mode = make("TextButton", 50, "Mode: Closest", Color3.fromRGB(80, 140, 255))
+local tl = make("TextLabel", 40, "No target", Color3.fromRGB(170, 90, 230))
+local sl = make("TextLabel", 34, "Smoothness 50%", Color3.fromRGB(40, 190, 170))
+local track = make("TextButton", 22, "", Color3.fromRGB(60, 60, 60))
+track.AutoButtonColor = false
+local fill = new("Frame", {Size = UDim2.new(0.5, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(120, 255, 120)}, track)
+new("UICorner", {CornerRadius = UDim.new(0, 14)}, fill)
+
+-- open/close icon
+local icon = new("ImageButton", {Size = UDim2.new(0, 60, 0, 60), Position = UDim2.new(0, 15, 0.5, -30),
+	Image = "rbxassetid://8508980527", BackgroundColor3 = YELLOW, ZIndex = 10}, gui)
+outline(icon, 16, 4)
+
+-- ===== Dragging =====
+local full = false
+local function draggable(handles, obj, canDrag)
+	local d, moved, start, startPos = false, false, nil, nil
+	for _, h in handles do
+		h.InputBegan:Connect(function(i)
+			if isPress(i) and (not canDrag or canDrag()) then
+				d, moved, start, startPos = true, false, i.Position, obj.Position
+			end
+		end)
+	end
+	UIS.InputChanged:Connect(function(i)
+		if d and isMove(i) then
+			local delta = i.Position - start
+			if delta.Magnitude > 5 then moved = true end
+			obj.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+	UIS.InputEnded:Connect(function(i)
+		if isPress(i) then d = false end
+	end)
+	return function() return moved end
+end
+
+draggable({bar, title}, win, function() return not full end)
+local iconMoved = draggable({icon}, icon)
+
+icon.Activated:Connect(function()
+	if not iconMoved() then win.Visible = not win.Visible end
+end)
+closeBtn.Activated:Connect(function() win.Visible = false end)
+
+local savedPos
+fullBtn.Activated:Connect(function()
+	full = not full
+	if full then
+		savedPos = win.Position
+		win.Size, win.Position = UDim2.new(1, 0, 1, 0), UDim2.new(0, 0, 0, 0)
+	else
+		win.Size, win.Position = NORMAL_SIZE, savedPos
+	end
+	fullBtn.Text = full and "SMALL" or "FULL"
+end)
+
+-- ===== Targeting =====
+local function valid(p)
+	local h = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	return h and h.Health > 0 and p.Character:FindFirstChild("Head") ~= nil
+end
+
+local function dist(p) return (p.Character.Head.Position - cam.CFrame.Position).Magnitude end
+
+local function pick()
+	local list = {}
+	for _, p in P:GetPlayers() do
+		if p ~= me and valid(p) then table.insert(list, p) end
+	end
+	if #list == 0 then return nil end
+	if rand then return list[math.random(#list)] end
+	table.sort(list, function(a, b) return dist(a) < dist(b) end)
+	return list[1]
+end
+
+local function set(state)
+	on, target = state, nil
+	toggle.Text = (on and "ON" or "OFF") .. " [Q]"
+	toggle.BackgroundColor3 = on and Color3.fromRGB(60, 200, 90) or Color3.fromRGB(235, 70, 70)
+	if not on then tl.Text = "No target" end
+end
+
+toggle.Activated:Connect(function() set(not on) end)
+UIS.InputBegan:Connect(function(i, gp)
+	if not gp and i.KeyCode == Enum.KeyCode.Q then set(not on) end
+end)
+mode.Activated:Connect(function()
+	rand, target = not rand, nil
+	mode.Text = "Mode: " .. (rand and "Random" or "Closest")
+end)
+
+-- ===== Slider =====
+local sliding = false
+local function slide(x)
+	local r = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+	smooth = math.max(0.05, r)
+	fill.Size = UDim2.new(r, 0, 1, 0)
+	sl.Text = "Smoothness " .. math.floor(r * 100) .. "%"
+end
+track.InputBegan:Connect(function(i)
+	if isPress(i) then sliding = true slide(i.Position.X) end
+end)
+UIS.InputChanged:Connect(function(i)
+	if sliding and isMove(i) then slide(i.Position.X) end
+end)
+UIS.InputEnded:Connect(function(i)
+	if isPress(i) then sliding = false end
+end)
+
+-- ===== Aim loop =====
+RS:BindToRenderStep("AimLock", Enum.RenderPriority.Camera.Value + 1, function()
+	if not on then return end
+	if not valid(target) then target = pick() end
+	if valid(target) then
+		tl.Text = "🎯 " .. target.Name
+		cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(cam.CFrame.Position, target.Character.Head.Position), smooth)
+	else
+		tl.Text = "No target"
+	end
+end)
