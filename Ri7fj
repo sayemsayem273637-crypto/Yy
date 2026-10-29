@@ -1,0 +1,932 @@
+--// ============================================================
+--//  AIM LOCK PRO  |  LocalScript  ->  StarterGui
+--//  Native Roblox UI, lock-on, highlight, target switching
+--//  made by @broken2xboost
+--// ============================================================
+
+--// Version system
+local VERSION = "V.1"
+local CHANGELOG = {
+	"Lock-on camera with smooth tracking",
+	"Highlight + name tag on your target",
+	"Next / Prev target switching",
+	"Wall check (checks head and body)",
+	"Team check, prediction, FOV circle",
+	"Version system",
+}
+
+--// Services
+local Players = game:GetService("Players")
+local RS = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TS = game:GetService("TweenService")
+local ContentProvider = game:GetService("ContentProvider")
+
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+--// Your open-button image
+local ICON_ID = "rbxassetid://76901993090502"
+
+--// Config (all of these can be changed live from the UI)
+local CFG = {
+	Enabled = false,
+	Highlight = true,
+	ShowFOV = true,
+	TeamCheck = false,
+	WallCheck = false,
+	AutoRetarget = true,
+	Prediction = false,
+	PredictAmt = 0.12,
+	TargetPart = "Head",   -- Head / Torso
+	Mode = "Closest",      -- Closest / Crosshair
+	Smooth = 0.35,         -- 0.05 = soft, 1 = hard lock
+	FOV = 300,
+	MaxDist = 500,
+
+	ToggleKey = Enum.KeyCode.Q,
+	NextKey = Enum.KeyCode.E,
+	PrevKey = Enum.KeyCode.R,
+	HideKey = Enum.KeyCode.RightShift,
+}
+
+--// Theme
+local T = {
+	Bg = Color3.fromRGB(16, 16, 26),
+	Panel = Color3.fromRGB(28, 28, 44),
+	Accent = Color3.fromRGB(120, 90, 255),
+	Accent2 = Color3.fromRGB(255, 80, 160),
+	On = Color3.fromRGB(70, 220, 140),
+	Off = Color3.fromRGB(65, 65, 92),
+	Text = Color3.fromRGB(255, 255, 255),
+	Sub = Color3.fromRGB(170, 170, 205),
+	Red = Color3.fromRGB(255, 80, 90),
+	Title = Enum.Font.FredokaOne,
+	Body = Enum.Font.GothamBold,
+}
+
+--// ============================================================
+--//  Cleanup of an older copy (fixes duplicates after respawn)
+--// ============================================================
+if _G.AimLockProCleanup then
+	pcall(_G.AimLockProCleanup)
+end
+
+local conns = {}
+local function on(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(conns, c)
+	return c
+end
+
+--// ============================================================
+--//  Helpers
+--// ============================================================
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in props do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local function round(o, r)
+	return new("UICorner", {CornerRadius = UDim.new(0, r)}, o)
+end
+
+local function stroke(o, color, thick)
+	return new("UIStroke", {
+		Color = color,
+		Thickness = thick,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, o)
+end
+
+local function tween(o, t, props)
+	TS:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function isPress(i)
+	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMove(i)
+	return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch
+end
+
+on(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+	cam = workspace.CurrentCamera
+end)
+
+--// ============================================================
+--//  State
+--// ============================================================
+local target, hl, tag = nil, nil, nil
+local sync = {}
+local setEnabled, pick, setTarget, notify
+
+--// ============================================================
+--//  GUI
+--// ============================================================
+local playerGui = lp:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild("AimLockPro")
+if oldGui then oldGui:Destroy() end
+
+local gui = new("ScreenGui", {
+	Name = "AimLockPro",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+gui:SetAttribute("Version", VERSION)
+
+-- FOV circle
+local fov = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(CFG.FOV * 2, CFG.FOV * 2),
+	BackgroundTransparency = 1,
+	Visible = false,
+}, gui)
+round(fov, 9999)
+stroke(fov, T.Accent, 2)
+
+-- Toast notification
+local toast = new("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, -80),
+	Size = UDim2.fromOffset(300, 58),
+	BackgroundColor3 = T.Bg,
+	TextColor3 = T.Text,
+	Font = T.Title,
+	TextSize = 20,
+	TextWrapped = true,
+	RichText = true,
+	Text = "",
+	ZIndex = 20,
+}, gui)
+round(toast, 20)
+stroke(toast, T.Accent, 2)
+
+local toastId = 0
+notify = function(msg, dur)
+	toastId += 1
+	local id = toastId
+	toast.Text = msg
+	tween(toast, 0.25, {Position = UDim2.new(0.5, 0, 0, 20)})
+	task.delay(dur or 1.6, function()
+		if id == toastId then
+			tween(toast, 0.25, {Position = UDim2.new(0.5, 0, 0, -80)})
+		end
+	end)
+end
+
+-- Main window
+local main = new("Frame", {
+	Name = "Main",
+	Position = UDim2.new(0, 20, 0, 80),
+	Size = UDim2.fromOffset(300, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = T.Bg,
+	BackgroundTransparency = 0.05,
+	Visible = false, -- starts closed, open it with the icon button
+}, gui)
+round(main, 18)
+stroke(main, T.Accent, 2)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
+	PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6),
+}, main)
+new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, main)
+
+-- Open button (image icon, shows a target emoji if the image fails to load)
+local openBtn = new("ImageButton", {
+	Name = "OpenButton",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(1, -50, 0.5, 0), -- right side, middle of the screen
+	Size = UDim2.fromOffset(56, 56),
+	BackgroundColor3 = T.Bg,
+	Image = ICON_ID,
+	ScaleType = Enum.ScaleType.Fit,
+	AutoButtonColor = false,
+}, gui)
+round(openBtn, 16)
+stroke(openBtn, T.Accent, 2)
+
+local fallback = new("TextLabel", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	Text = "🎯",
+	TextSize = 30,
+	TextColor3 = T.Text,
+	Font = T.Title,
+	Visible = false,
+}, openBtn)
+
+task.spawn(function()
+	pcall(function() ContentProvider:PreloadAsync({openBtn}) end)
+	if not openBtn.IsLoaded then
+		fallback.Visible = true
+	end
+end)
+
+openBtn.Activated:Connect(function()
+	main.Visible = not main.Visible
+	openBtn.Size = UDim2.fromOffset(46, 46)
+	tween(openBtn, 0.15, {Size = UDim2.fromOffset(56, 56)})
+end)
+
+-- Title bar
+local bar = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 42),
+	BackgroundColor3 = T.Accent,
+	LayoutOrder = 1,
+	ZIndex = 5,
+}, main)
+round(bar, 13)
+new("UIGradient", {
+	Color = ColorSequence.new(T.Accent, T.Accent2),
+	Rotation = 20,
+}, bar)
+
+new("TextLabel", {
+	Position = UDim2.fromOffset(14, 0),
+	Size = UDim2.new(1, -76, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "🎯 AIM LOCK PRO",
+	TextColor3 = T.Text,
+	Font = T.Title,
+	TextSize = 20,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, bar)
+
+-- Version badge (tap it to see what's new)
+local verBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -10, 0.5, 0),
+	Size = UDim2.fromOffset(48, 26),
+	BackgroundColor3 = Color3.new(0, 0, 0),
+	BackgroundTransparency = 0.5,
+	Text = VERSION,
+	TextColor3 = T.Text,
+	Font = T.Title,
+	TextSize = 15,
+	AutoButtonColor = false,
+}, bar)
+round(verBtn, 9)
+
+-- Changelog popup (hangs under the title bar)
+local notes = new("Frame", {
+	Position = UDim2.new(0, 0, 1, 8),
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = T.Panel,
+	Visible = false,
+	ZIndex = 6,
+}, bar)
+round(notes, 12)
+stroke(notes, T.Accent2, 2)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+}, notes)
+new("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, notes)
+
+new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 22),
+	BackgroundTransparency = 1,
+	Text = "What's new in " .. VERSION,
+	TextColor3 = T.Accent2,
+	Font = T.Title,
+	TextSize = 17,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	LayoutOrder = 0,
+}, notes)
+
+for n, line in CHANGELOG do
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Text = "•  " .. line,
+		TextColor3 = T.Text,
+		Font = T.Body,
+		TextSize = 13,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = n,
+	}, notes)
+end
+
+verBtn.Activated:Connect(function()
+	notes.Visible = not notes.Visible
+end)
+
+-- Body
+local body = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	LayoutOrder = 2,
+}, main)
+new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, body)
+
+-- Dragging
+do
+	local dragging, dragStart, startPos = false, nil, nil
+	bar.InputBegan:Connect(function(i)
+		if isPress(i) then
+			dragging, dragStart, startPos = true, i.Position, main.Position
+		end
+	end)
+	on(UIS.InputChanged, function(i)
+		if dragging and isMove(i) then
+			local d = i.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+	on(UIS.InputEnded, function(i)
+		if isPress(i) then dragging = false end
+	end)
+end
+
+-- Status card
+local card = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 80),
+	BackgroundColor3 = T.Panel,
+	LayoutOrder = 1,
+}, body)
+round(card, 12)
+stroke(card, T.Off, 1)
+
+local nameLbl = new("TextLabel", {
+	Position = UDim2.fromOffset(12, 8),
+	Size = UDim2.new(1, -24, 0, 22),
+	BackgroundTransparency = 1,
+	Text = "No target",
+	TextColor3 = T.Text,
+	Font = T.Title,
+	TextSize = 18,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, card)
+
+local hpBack = new("Frame", {
+	Position = UDim2.fromOffset(12, 38),
+	Size = UDim2.new(1, -24, 0, 10),
+	BackgroundColor3 = T.Off,
+}, card)
+round(hpBack, 5)
+local hpFill = new("Frame", {
+	Size = UDim2.fromScale(0, 1),
+	BackgroundColor3 = T.On,
+	BorderSizePixel = 0,
+}, hpBack)
+round(hpFill, 5)
+
+local distLbl = new("TextLabel", {
+	Position = UDim2.fromOffset(12, 54),
+	Size = UDim2.new(1, -24, 0, 18),
+	BackgroundTransparency = 1,
+	Text = "--",
+	TextColor3 = T.Sub,
+	Font = T.Body,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, card)
+
+-- Scroll area
+local scroll = new("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 0, 280),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 4,
+	ScrollBarImageColor3 = T.Accent,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	LayoutOrder = 2,
+}, body)
+new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
+new("UIPadding", {PaddingRight = UDim.new(0, 8)}, scroll)
+
+new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 18),
+	BackgroundTransparency = 1,
+	Text = "Q Lock  •  E Next  •  R Prev  •  RShift Hide",
+	TextColor3 = T.Sub,
+	Font = T.Body,
+	TextSize = 11,
+	LayoutOrder = 3,
+}, body)
+
+--// UI components
+local function section(text)
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Text = text,
+		TextColor3 = T.Accent2,
+		Font = T.Title,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, scroll)
+end
+
+local function toggleRow(label, key, onChange)
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = T.Panel,
+		Text = "",
+		AutoButtonColor = false,
+	}, scroll)
+	round(row, 10)
+	new("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(1, -70, 1, 0),
+		BackgroundTransparency = 1,
+		Text = label,
+		TextColor3 = T.Text,
+		Font = T.Body,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local pill = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.fromOffset(40, 20),
+		BackgroundColor3 = T.Off,
+	}, row)
+	round(pill, 10)
+	local knob = new("Frame", {
+		Position = UDim2.fromOffset(2, 2),
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = T.Text,
+	}, pill)
+	round(knob, 8)
+
+	local function render()
+		local isOn = CFG[key]
+		tween(pill, 0.15, {BackgroundColor3 = isOn and T.On or T.Off})
+		tween(knob, 0.15, {Position = isOn and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)})
+	end
+	sync[key] = render
+	row.Activated:Connect(function()
+		CFG[key] = not CFG[key]
+		render()
+		if onChange then onChange(CFG[key]) end
+	end)
+	render()
+end
+
+local function selector(label, key, options, onChange)
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = T.Panel,
+		Text = "",
+		AutoButtonColor = false,
+	}, scroll)
+	round(row, 10)
+	new("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(0.5, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Text = label,
+		TextColor3 = T.Text,
+		Font = T.Body,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local val = new("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 0),
+		Size = UDim2.new(0.5, -12, 1, 0),
+		BackgroundTransparency = 1,
+		Text = CFG[key] .. "  ▸",
+		TextColor3 = T.Accent,
+		Font = T.Title,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, row)
+	row.Activated:Connect(function()
+		local idx = table.find(options, CFG[key]) or 1
+		CFG[key] = options[idx % #options + 1]
+		val.Text = CFG[key] .. "  ▸"
+		if onChange then onChange(CFG[key]) end
+	end)
+end
+
+local function slider(label, key, min, max, decimals)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 52),
+		BackgroundColor3 = T.Panel,
+	}, scroll)
+	round(row, 10)
+	local lbl = new("TextLabel", {
+		Position = UDim2.fromOffset(12, 4),
+		Size = UDim2.new(1, -24, 0, 20),
+		BackgroundTransparency = 1,
+		TextColor3 = T.Text,
+		Font = T.Body,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local hit = new("Frame", {
+		Position = UDim2.fromOffset(12, 28),
+		Size = UDim2.new(1, -24, 0, 18),
+		BackgroundTransparency = 1,
+	}, row)
+	local track = new("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 8),
+		BackgroundColor3 = T.Off,
+	}, hit)
+	round(track, 4)
+	local fill = new("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = T.Accent,
+		BorderSizePixel = 0,
+	}, track)
+	round(fill, 4)
+	new("UIGradient", {Color = ColorSequence.new(T.Accent, T.Accent2)}, fill)
+	local knob = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = T.Text,
+	}, track)
+	round(knob, 8)
+
+	local function set(v)
+		v = math.clamp(v, min, max)
+		local m = 10 ^ decimals
+		v = math.floor(v * m + 0.5) / m
+		CFG[key] = v
+		local a = (v - min) / (max - min)
+		fill.Size = UDim2.fromScale(a, 1)
+		knob.Position = UDim2.fromScale(a, 0.5)
+		lbl.Text = label .. ": " .. v
+	end
+	local function fromX(x)
+		set(min + (max - min) * math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1))
+	end
+
+	local dragging = false
+	hit.InputBegan:Connect(function(i)
+		if isPress(i) then
+			dragging = true
+			fromX(i.Position.X)
+		end
+	end)
+	on(UIS.InputChanged, function(i)
+		if dragging and isMove(i) then fromX(i.Position.X) end
+	end)
+	on(UIS.InputEnded, function(i)
+		if isPress(i) then dragging = false end
+	end)
+	set(CFG[key])
+end
+
+local function buttonRow(a, b)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 38),
+		BackgroundTransparency = 1,
+	}, scroll)
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+	}, row)
+	for _, def in {a, b} do
+		local btn = new("TextButton", {
+			Size = UDim2.new(0.5, -3, 1, 0),
+			BackgroundColor3 = def.color,
+			Text = def.text,
+			TextColor3 = T.Text,
+			Font = T.Title,
+			TextSize = 16,
+			AutoButtonColor = false,
+		}, row)
+		round(btn, 10)
+		stroke(btn, Color3.new(0, 0, 0), 2)
+		btn.MouseEnter:Connect(function()
+			tween(btn, 0.12, {BackgroundColor3 = def.color:Lerp(Color3.new(1, 1, 1), 0.15)})
+		end)
+		btn.MouseLeave:Connect(function()
+			tween(btn, 0.12, {BackgroundColor3 = def.color})
+		end)
+		btn.Activated:Connect(def.fn)
+	end
+end
+
+--// ============================================================
+--//  Targeting logic
+--// ============================================================
+local function alive(p)
+	local c = p.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	local r = c and c:FindFirstChild("HumanoidRootPart")
+	return c ~= nil and h ~= nil and r ~= nil and h.Health > 0
+end
+
+local function partOf(c)
+	if CFG.TargetPart == "Head" then
+		return c:FindFirstChild("Head")
+	end
+	return c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or c:FindFirstChild("HumanoidRootPart")
+end
+
+-- Wall check: ray from the camera to the target. Ignores your own character,
+-- the target, non-collidable parts and water.
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+rayParams.IgnoreWater = true
+
+local function clearPath(part, char)
+	local origin = cam.CFrame.Position
+	local filter = {char}
+	if lp.Character then
+		table.insert(filter, lp.Character)
+	end
+	rayParams.FilterDescendantsInstances = filter
+	return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+end
+
+-- Visible if the aim part OR the body center can be seen
+local function visible(char)
+	local aim = partOf(char)
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if aim and clearPath(aim, char) then return true end
+	if root and root ~= aim and clearPath(root, char) then return true end
+	return false
+end
+
+-- Is this player still a legal target right now?
+local function valid(p)
+	if not p or not alive(p) then return false end
+	if CFG.TeamCheck and lp.Team and p.Team == lp.Team then return false end
+	local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	local root = p.Character:FindFirstChild("HumanoidRootPart")
+	if myRoot and root and (root.Position - myRoot.Position).Magnitude > CFG.MaxDist * 1.2 then
+		return false
+	end
+	return true
+end
+
+local function candidates()
+	local list = {}
+	local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	if not myRoot then return list end
+	local center = cam.ViewportSize / 2
+
+	for _, p in Players:GetPlayers() do
+		if p ~= lp and alive(p) and not (CFG.TeamCheck and lp.Team and p.Team == lp.Team) then
+			local part = partOf(p.Character)
+			if part then
+				local dist = (part.Position - myRoot.Position).Magnitude
+				if dist <= CFG.MaxDist then
+					local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+					local screenDist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+					local inRange = CFG.Mode == "Closest" or (onScreen and screenDist <= CFG.FOV)
+					if inRange and (not CFG.WallCheck or visible(p.Character)) then
+						table.insert(list, {
+							p = p,
+							score = CFG.Mode == "Closest" and dist or screenDist,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(list, function(a, b) return a.score < b.score end)
+	return list
+end
+
+local function makeVisuals()
+	if not target or not target.Character then return end
+	if CFG.Highlight then
+		hl = new("Highlight", {
+			FillColor = T.Accent2,
+			OutlineColor = Color3.new(1, 1, 1),
+			FillTransparency = 0.55,
+			OutlineTransparency = 0,
+			DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+		}, target.Character)
+	end
+	local head = target.Character:FindFirstChild("Head")
+	if head then
+		tag = new("BillboardGui", {
+			Size = UDim2.fromOffset(150, 28),
+			StudsOffset = Vector3.new(0, 2.5, 0),
+			AlwaysOnTop = true,
+			Adornee = head,
+		}, head)
+		local l = new("TextLabel", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = T.Bg,
+			BackgroundTransparency = 0.2,
+			Text = "🎯 " .. target.DisplayName,
+			TextColor3 = T.Text,
+			Font = T.Title,
+			TextSize = 16,
+		}, tag)
+		round(l, 10)
+		stroke(l, T.Accent2, 2)
+	end
+end
+
+setTarget = function(p)
+	if hl then hl:Destroy() hl = nil end
+	if tag then tag:Destroy() tag = nil end
+	target = p
+	makeVisuals()
+end
+
+-- step: nil = best target, 1 = next, -1 = previous
+pick = function(step)
+	local list = candidates()
+	if #list == 0 then
+		setTarget(nil)
+		return
+	end
+	local idx = 1
+	if step then
+		for n, v in list do
+			if v.p == target then
+				idx = (n - 1 + step) % #list + 1
+				break
+			end
+		end
+	end
+	setTarget(list[idx].p)
+end
+
+setEnabled = function(isOn)
+	CFG.Enabled = isOn
+	if isOn then pick() else setTarget(nil) end
+	if sync.Enabled then sync.Enabled() end
+	notify(isOn and "Lock ON 🎯" or "Lock OFF")
+end
+
+local function switch(step)
+	if not CFG.Enabled then
+		notify("Turn lock on first")
+		return
+	end
+	pick(step)
+	notify(target and ("Target: " .. target.DisplayName) or "No targets")
+end
+
+--// ============================================================
+--//  Build controls
+--// ============================================================
+section("MAIN")
+toggleRow("Lock On", "Enabled", function(v) setEnabled(v) end)
+buttonRow(
+	{text = "◀ Prev", color = Color3.fromRGB(90, 150, 255), fn = function() switch(-1) end},
+	{text = "Next ▶", color = Color3.fromRGB(255, 140, 70), fn = function() switch(1) end}
+)
+selector("Mode", "Mode", {"Closest", "Crosshair"}, function()
+	if CFG.Enabled then pick() end
+end)
+selector("Aim Part", "TargetPart", {"Head", "Torso"})
+
+section("VISUALS")
+toggleRow("Highlight", "Highlight", function()
+	setTarget(target)
+end)
+toggleRow("Show FOV Circle", "ShowFOV")
+
+section("FILTERS")
+toggleRow("Team Check", "TeamCheck", function()
+	if CFG.Enabled then pick() end
+end)
+toggleRow("Wall Check", "WallCheck", function()
+	if CFG.Enabled then pick() end
+end)
+toggleRow("Auto Retarget", "AutoRetarget")
+
+section("TUNING")
+slider("Smoothness", "Smooth", 0.05, 1, 2)
+slider("FOV Size", "FOV", 50, 600, 0)
+slider("Max Distance", "MaxDist", 50, 1000, 0)
+toggleRow("Prediction", "Prediction")
+slider("Prediction Amount", "PredictAmt", 0, 0.3, 2)
+
+--// ============================================================
+--//  Input
+--// ============================================================
+on(UIS.InputBegan, function(i, gp)
+	if gp then return end
+	local k = i.KeyCode
+	if k == CFG.ToggleKey then
+		setEnabled(not CFG.Enabled)
+	elseif k == CFG.NextKey then
+		switch(1)
+	elseif k == CFG.PrevKey then
+		switch(-1)
+	elseif k == CFG.HideKey then
+		main.Visible = not main.Visible
+	end
+end)
+
+--// ============================================================
+--//  Status card + FOV refresh (10x per second)
+--// ============================================================
+local acc = 0
+on(RS.Heartbeat, function(dt)
+	acc += dt
+	if acc < 0.1 then return end
+	acc = 0
+
+	fov.Visible = CFG.ShowFOV and CFG.Mode == "Crosshair"
+	fov.Size = UDim2.fromOffset(CFG.FOV * 2, CFG.FOV * 2)
+
+	if target and alive(target) then
+		local h = target.Character:FindFirstChildOfClass("Humanoid")
+		local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+		local root = target.Character:FindFirstChild("HumanoidRootPart")
+		local ratio = math.clamp(h.Health / h.MaxHealth, 0, 1)
+
+		nameLbl.Text = "🎯 " .. target.DisplayName
+		tween(hpFill, 0.1, {
+			Size = UDim2.fromScale(ratio, 1),
+			BackgroundColor3 = T.Red:Lerp(T.On, ratio),
+		})
+		if myRoot and root then
+			distLbl.Text = string.format(
+				"%d studs  •  %d HP",
+				math.floor((root.Position - myRoot.Position).Magnitude),
+				math.floor(h.Health)
+			)
+		end
+	else
+		nameLbl.Text = CFG.Enabled and "Searching..." or "No target"
+		hpFill.Size = UDim2.fromScale(0, 1)
+		distLbl.Text = "--"
+	end
+end)
+
+--// ============================================================
+--//  Camera lock (runs right after the default camera)
+--// ============================================================
+local lastScan = 0
+
+pcall(function() RS:UnbindFromRenderStep("AimLockPro") end)
+RS:BindToRenderStep("AimLockPro", Enum.RenderPriority.Camera.Value + 1, function()
+	-- pulsing highlight
+	if hl then
+		hl.FillColor = T.Accent:Lerp(T.Accent2, (math.sin(os.clock() * 4) + 1) / 2)
+	end
+
+	if not CFG.Enabled then return end
+
+	-- target lost / dead / out of range / now a teammate? find a new one (throttled)
+	if not valid(target) then
+		if os.clock() - lastScan < 0.25 then return end
+		lastScan = os.clock()
+		if CFG.AutoRetarget then
+			pick()
+		else
+			setEnabled(false)
+		end
+		if not target then return end
+	end
+
+	local char = target.Character
+	local part = char and partOf(char)
+	if not part then return end
+
+	-- wall check: target hidden behind a wall -> don't track, look for a visible one
+	if CFG.WallCheck and not visible(char) then
+		if CFG.AutoRetarget and os.clock() - lastScan >= 0.25 then
+			lastScan = os.clock()
+			pick()
+		end
+		return
+	end
+
+	local pos = part.Position
+	if CFG.Prediction then
+		pos += part.AssemblyLinearVelocity * CFG.PredictAmt
+	end
+
+	cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(cam.CFrame.Position, pos), CFG.Smooth)
+end)
+
+--// Cleanup hook so a respawned copy of this script never doubles up
+_G.AimLockProCleanup = function()
+	for _, c in conns do
+		c:Disconnect()
+	end
+	pcall(function() RS:UnbindFromRenderStep("AimLockPro") end)
+	if hl then hl:Destroy() end
+	if tag then tag:Destroy() end
+	gui:Destroy()
+end
+
+print("[AimLockPro] " .. VERSION .. " loaded")
+notify('AIMLOCK PRO LOADED✅\n<font size="14" color="#FF50A0">made by @broken2xboost</font>', 3.5)
